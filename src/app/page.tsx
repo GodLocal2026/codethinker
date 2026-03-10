@@ -1,0 +1,997 @@
+'use client'
+// build-trigger: 24830cac
+
+import { useState, useRef, useEffect, useCallback } from 'react'
+import { useLocalLLM, type LocalLLMStatus } from '@/lib/useLocalLLM'
+import { useAgentMemory } from '@/hooks/useAgentMemory'
+import {
+  getLocalSessionId,
+  clearLocalSessionId,
+  ensureSession,
+  setSessionTitle,
+  saveMessage,
+  loadSessions,
+  loadMessages,
+  type Session,
+} from '@/lib/chatHistory'
+import { motion, AnimatePresence } from 'framer-motion'
+
+
+interface Msg {
+  id: string
+  role: 'user' | 'ai' | 'system'
+  content: string
+  streaming?: boolean
+  ts: number
+  image?: string
+  thinkingSteps?: string[]
+  thinkingOpen?: boolean
+  thinkingDone?: boolean
+}
+
+type Mode = 'vibe' | 'debug' | 'refactor' | 'architect' | 'explain' | 'search'
+
+const MODES: { key: Mode; icon: string; label: string; desc: string }[] = [
+  { key: 'vibe',      icon: '🔨', label: 'Vibe Code', desc: 'Опиши идею — получи проект' },
+  { key: 'debug',     icon: '🧩', label: 'Debug',     desc: 'Вставь ошибку — найду баг' },
+  { key: 'refactor',  icon: '🔄', label: 'Refactor',  desc: 'Оптимизирую и почищу код' },
+  { key: 'architect', icon: '📐', label: 'Architect',  desc: 'Спроектирую архитектуру' },
+  { key: 'explain',   icon: '📝', label: 'Explain',   desc: 'Объясню чужой код' },
+  { key: 'search',    icon: '🌐', label: 'Search',    desc: 'Ищу в интернете — live данные' },
+]
+
+const QUICK: Record<Mode, string[]> = {
+  vibe:      ['DeFi dashboard на Next.js + Solana', 'Telegram бот для мониторинга крипто', 'CLI tool на Rust для парсинга логов', 'REST API на Go + PostgreSQL'],
+  debug:     ['Почему useEffect вызывается дважды?', 'CORS error при fetch запросе', 'Memory leak в Node.js сервере', 'TypeScript: Type X is not assignable to Y'],
+  refactor:  ['Оптимизируй мой React компонент', 'Типизируй JavaScript → TypeScript', 'Уменьши сложность O(n²) → O(n)', 'Декомпозируй монолит на модули'],
+  architect: ['Микросервисы для e-commerce платформы', 'Real-time чат на WebSocket', 'CI/CD pipeline для монорепо', 'Архитектура мобильного приложения'],
+  explain:   ['Что делает этот Solidity контракт?', 'Как работает этот regex?', 'Разбери этот Docker compose', 'Объясни этот SQL запрос'],
+  search:    ['Что нового в Next.js 15?', 'Цена Bitcoin и Solana сейчас', 'Последние новости Solana ecosystem', 'Лучшие AI инструменты для разработчиков 2026'],
+}
+
+function uid() { return Math.random().toString(36).slice(2) }
+
+// -- Markdown renderer -------------------------------------------------------
+function renderMarkdown(text: string): React.ReactNode[] {
+  const lines = text.split('\n')
+  const nodes: React.ReactNode[] = []
+  let i = 0
+
+  function inlineRender(line: string): React.ReactNode {
+    const parts: React.ReactNode[] = []
+    const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g
+    let lastIdx = 0; let key = 0; let m: RegExpExecArray | null
+    while ((m = linkRe.exec(line)) !== null) {
+      if (m.index > lastIdx) parts.push(inlineBold(line.slice(lastIdx, m.index), key++))
+      parts.push(
+        <a key={key++} href={m[2]} target="_blank" rel="noopener noreferrer"
+          className="text-[#A78BFA] underline underline-offset-2 hover:text-[#A78BFA]/80 transition-colors break-all">{m[1]}</a>
+      )
+      lastIdx = m.index + m[0].length
+    }
+    if (lastIdx < line.length) parts.push(inlineBold(line.slice(lastIdx), key++))
+    return parts.length === 1 ? parts[0] : <>{parts}</>
+  }
+
+  function inlineBold(text: string, key: number): React.ReactNode {
+    const parts: React.ReactNode[] = []
+    const boldRe = /\*\*(.+?)\*\*/g
+    let lastIdx = 0; let m: RegExpExecArray | null; let k = 0
+    while ((m = boldRe.exec(text)) !== null) {
+      if (m.index > lastIdx) parts.push(<span key={k++}>{text.slice(lastIdx, m.index)}</span>)
+      parts.push(<strong key={k++} className="text-white font-semibold">{m[1]}</strong>)
+      lastIdx = m.index + m[0].length
+    }
+    if (lastIdx < text.length) parts.push(<span key={k++}>{text.slice(lastIdx)}</span>)
+    return parts.length === 0 ? text : parts.length === 1 ? parts[0] : <>{parts}</>
+  }
+
+  while (i < lines.length) {
+    const line = lines[i]
+    if (!line.trim()) { nodes.push(<div key={i} className="h-2" />); i++; continue }
+    if (line.startsWith('# '))  { nodes.push(<h1 key={i} className="text-base font-bold text-white mt-2 mb-1">{inlineRender(line.slice(2))}</h1>); i++; continue }
+    if (line.startsWith('## ')) { nodes.push(<h2 key={i} className="text-sm font-bold text-white/90 mt-2 mb-0.5">{inlineRender(line.slice(3))}</h2>); i++; continue }
+    if (line.startsWith('### ')){ nodes.push(<h3 key={i} className="text-sm font-semibold text-white/75 mt-1">{inlineRender(line.slice(4))}</h3>); i++; continue }
+    if (line.match(/^[-*\u2022] /)) {
+      const items: React.ReactNode[] = []
+      while (i < lines.length && lines[i].match(/^[-*\u2022] /)) {
+        items.push(<li key={i} className="flex gap-2 items-start"><span className="text-[#A78BFA]/60 mt-0.5 shrink-0">&middot;</span><span>{inlineRender(lines[i].replace(/^[-*\u2022] /,''))}</span></li>)
+        i++
+      }
+      nodes.push(<ul key={`ul-${i}`} className="space-y-1 my-1">{items}</ul>); continue
+    }
+    if (line.match(/^\d+\. /)) {
+      const items: React.ReactNode[] = []; let num = 1
+      while (i < lines.length && lines[i].match(/^\d+\. /)) {
+        items.push(<li key={i} className="flex gap-2 items-start"><span className="text-[#A78BFA]/50 shrink-0 w-5 text-right">{num}.</span><span>{inlineRender(lines[i].replace(/^\d+\. /,''))}</span></li>)
+        i++; num++
+      }
+      nodes.push(<ol key={`ol-${i}`} className="space-y-1 my-1">{items}</ol>); continue
+    }
+    if (line.startsWith('```')) {
+      const codeLines: string[] = []; i++
+      while (i < lines.length && !lines[i].startsWith('```')) { codeLines.push(lines[i]); i++ }
+      const codeStr = codeLines.join('\n')
+      nodes.push(
+        <div key={i} className="relative group my-2">
+          <pre className="bg-black/50 border border-white/10 rounded-xl px-3 py-2 overflow-x-auto text-xs font-mono text-[#A78BFA]/80 leading-relaxed">{codeStr}</pre>
+          <button
+            onClick={() => { navigator.clipboard.writeText(codeStr) }}
+            className="absolute top-2 right-2 px-2 py-0.5 text-[9px] font-mono rounded bg-white/8 border border-white/12 text-white/35 hover:text-white/75 hover:bg-white/15 transition-all opacity-0 group-hover:opacity-100"
+          >Копировать</button>
+        </div>
+      )
+      i++; continue
+    }
+    if (line.match(/^---+$/)) { nodes.push(<hr key={i} className="border-white/10 my-2" />); i++; continue }
+    nodes.push(<p key={i} className="leading-relaxed">{inlineRender(line)}</p>)
+    i++
+  }
+  return nodes
+}
+
+function MsgContent({ content, streaming }: { content: string; streaming?: boolean }) {
+  return (
+    <div className="text-sm space-y-0.5 break-words overflow-hidden">
+      {renderMarkdown(content)}
+      {streaming && <span className="inline-block w-1.5 h-4 bg-[#A78BFA] rounded-sm ml-0.5 animate-pulse align-middle" />}
+    </div>
+  )
+}
+
+// -- ThinkingBlock -----------------------------------------------------------
+function ThinkingBlock({
+  steps, streaming, open, onToggle,
+}: {
+  steps: string[]; streaming?: boolean; open: boolean; onToggle: () => void
+}) {
+  if (!steps || steps.length === 0) return null
+  return (
+    <div className="mb-2">
+      <button
+        onClick={onToggle}
+        className="flex items-center gap-2 text-[10px] font-mono px-2.5 py-1 rounded-full border border-[#A78BFA]/15 bg-[#A78BFA]/5 text-[#A78BFA]/50 hover:text-[#A78BFA]/80 hover:border-[#A78BFA]/30 transition-all"
+      >
+        {streaming
+          ? <span className="w-1.5 h-1.5 rounded-full bg-[#A78BFA]/70 animate-pulse" />
+          : <span className="w-1.5 h-1.5 rounded-full bg-[#A78BFA]/35" />}
+        {streaming ? 'Thinking...' : `Thought process · ${steps.length} steps`}
+        <span className="opacity-40">{open ? '▲' : '▼'}</span>
+      </button>
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.18 }}
+            className="overflow-hidden"
+          >
+            <div
+              className="mt-1.5 px-3 py-2.5 bg-black/40 border border-white/8 rounded-xl font-mono text-[10px] md:text-[11px] text-white/40 leading-relaxed space-y-1 max-h-52 overflow-y-auto"
+              style={{ scrollbarWidth: 'thin', scrollbarColor: 'rgba(0,255,157,0.1) transparent' }}
+            >
+              {steps.map((s, i) => (
+                <div key={i} className="flex gap-2">
+                  <span className="text-[#A78BFA]/25 shrink-0 select-none">{String(i + 1).padStart(2, '0')}</span>
+                  <span className="text-white/45 break-words">{s}</span>
+                </div>
+              ))}
+              {streaming && (
+                <div className="flex gap-2 items-center">
+                  <span className="text-[#A78BFA]/25 shrink-0">--</span>
+                  <span className="inline-flex gap-1">
+                    {[0, 0.2, 0.4].map((d, i) => (
+                      <span key={i} className="w-1 h-1 rounded-full bg-[#A78BFA]/40 animate-bounce"
+                        style={{ animationDelay: `${d}s` }} />
+                    ))}
+                  </span>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+export default function CodeThinkerPage() {
+  const [msgs, setMsgs]                 = useState<Msg[]>([])
+  const [input, setInput]               = useState('')
+  const [loading, setLoading]           = useState(false)
+  const [imgPreview, setImgPreview]     = useState<string | null>(null)
+  const [imgBase64, setImgBase64]       = useState<string | null>(null)
+  const [imgMime, setImgMime]            = useState<string>('image/jpeg')
+  const [mode, setMode]                 = useState<Mode>('vibe')
+  const [aiMode, setAiMode]             = useState<'cloud' | 'local'>('cloud')
+  const [provider, setProvider]         = useState<'groq' | 'openai' | 'deepseek'>(() =>
+    typeof window !== 'undefined' ? (localStorage.getItem('ct_provider') as 'groq'|'openai'|'deepseek' || 'groq') : 'groq'
+  )
+  const [openaiKey, setOpenaiKey]       = useState<string>(() =>
+    typeof window !== 'undefined' ? (localStorage.getItem('ct_openai_key') || '') : ''
+  )
+  const [showSettings, setShowSettings] = useState(false)
+  const [keyInput, setKeyInput]         = useState('')
+  // ── Persistence ──────────────────────────────────────────────────────────
+  const [sessionId, setSessionId]       = useState<string>('')
+  const [sessions, setSessions]         = useState<Session[]>([])
+  const [historyOpen, setHistoryOpen]   = useState(false)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const sessionInitRef                  = useRef(false)
+  const localLLM = useLocalLLM()
+  const { context: memoryContext, saveMessage: saveToMemory } = useAgentMemory('codethinker')
+
+  const [isListening, setIsListening] = useState(false)
+  const [radioOpen, setRadioOpen] = useState(false)
+  const [radioPlaying, setRadioPlaying] = useState<string | null>(null)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const recognitionRef = useRef<ReturnType<typeof Object> | null>(null)
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const inputRef  = useRef<HTMLTextAreaElement>(null)
+  const fileRef   = useRef<HTMLInputElement>(null)
+  const msgsRef   = useRef<Msg[]>([])
+  const abortRef  = useRef<AbortController | null>(null)
+
+  useEffect(() => { msgsRef.current = msgs }, [msgs])
+
+  const scroll = () => bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  useEffect(scroll, [msgs])
+
+  // ── Init session on mount ─────────────────────────────────────────────────
+  useEffect(() => {
+    if (sessionInitRef.current) return
+    sessionInitRef.current = true
+    const sid = getLocalSessionId()
+    setSessionId(sid)
+    // Load messages for this session
+    loadMessages(sid).then(dbMsgs => {
+      if (dbMsgs.length === 0) return
+      const restored: Msg[] = dbMsgs
+        .filter(m => m.role !== 'system')
+        .map(m => ({
+          id: m.id,
+          role: m.role === 'assistant' ? 'ai' : 'user',
+          content: m.content,
+          ts: new Date(m.created_at).getTime(),
+          thinkingSteps: m.thinking ? m.thinking.split('\n---\n') : undefined,
+          thinkingOpen: false,
+          thinkingDone: true,
+        }))
+      if (restored.length > 0) setMsgs(restored)
+    })
+  }, [])
+
+  // Speech recognition setup
+  const toggleVoice = useCallback(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const W = globalThis as any
+    const SR = W.SpeechRecognition || W.webkitSpeechRecognition
+    if (!SR) { alert('Speech recognition not supported'); return }
+    if (isListening && recognitionRef.current) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (recognitionRef.current as any).stop()
+      setIsListening(false)
+      return
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const recognition: any = new SR()
+    recognition.lang = navigator.language || 'en-US'
+    recognition.interimResults = true
+    recognition.continuous = true
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recognition.onresult = (e: any) => {
+      let transcript = ''
+      for (let i = 0; i < e.results.length; i++) {
+        transcript += e.results[i][0].transcript
+      }
+      setInput(transcript)
+    }
+    recognition.onend = () => setIsListening(false)
+    recognition.onerror = () => setIsListening(false)
+    recognition.start()
+    recognitionRef.current = recognition
+    setIsListening(true)
+  }, [isListening])
+
+  // Radio stations
+  const RADIO_STATIONS = [
+    { name: 'Kiss FM 🇺🇦', url: 'https://online.kissfm.ua/KissFM', emoji: '💋' },
+    { name: 'Afro House', url: 'https://stream.sunshine-live.de/afrohouse/mp3-128', emoji: '🌍' },
+    { name: 'Hit FM 🇺🇦', url: 'https://online.hitfm.ua/HitFM', emoji: '🎤' },
+    { name: 'Київ FM', url: 'https://radio.kiev.fm', emoji: '🏙️' },
+    { name: 'Record FM', url: 'https://radiorecord.hostingradio.ru/rr_main96.aacp', emoji: '🔴' },
+  ]
+
+  const toggleRadio = (stationUrl: string) => {
+    if (radioPlaying === stationUrl) {
+      audioRef.current?.pause()
+      setRadioPlaying(null)
+      return
+    }
+    if (audioRef.current) audioRef.current.pause()
+    const audio = new Audio(stationUrl)
+    audio.play().catch(() => {})
+    audio.onerror = () => setRadioPlaying(null)
+    audioRef.current = audio
+    setRadioPlaying(stationUrl)
+  }
+
+  const isTalking = loading || (msgs.length > 0 &&
+    msgs[msgs.length - 1]?.role === 'ai' &&
+    msgs[msgs.length - 1]?.streaming === true)
+
+  const handleEvent = useCallback((type: string, val: string) => {
+    if (type === 'thinking_start') {
+      setMsgs(prev => [
+        ...prev,
+        { id: uid(), role: 'ai', content: '', streaming: true,
+          thinkingSteps: [], thinkingOpen: true, thinkingDone: false, ts: Date.now() }
+      ])
+    } else if (type === 'thinking') {
+      setMsgs(prev => {
+        const last = prev[prev.length - 1]
+        if (last?.role === 'ai')
+          return [...prev.slice(0, -1), {
+            ...last, thinkingSteps: [...(last.thinkingSteps || []), val]
+          }]
+        return prev
+      })
+    } else if (type === 'thinking_done') {
+      setMsgs(prev => {
+        const last = prev[prev.length - 1]
+        if (last?.role === 'ai')
+          return [...prev.slice(0, -1), {
+            ...last, thinkingDone: true, thinkingOpen: false
+          }]
+        return prev
+      })
+    } else if (type === 'token') {
+      setMsgs(prev => {
+        const last = prev[prev.length - 1]
+        if (last?.role === 'ai' && last.streaming)
+          return [...prev.slice(0, -1), { ...last, content: last.content + val }]
+        return [...prev, { id: uid(), role: 'ai', content: val, streaming: true,
+                           thinkingSteps: [], thinkingOpen: false, thinkingDone: true, ts: Date.now() }]
+      })
+    } else if (type === 'done') {
+      setMsgs(prev => {
+        const l = prev[prev.length - 1]
+        if (l?.role === 'ai') {
+          // Save completed AI response to persistent memory
+          if (l.content) saveToMemory('assistant', l.content).catch(() => {})
+          return [...prev.slice(0, -1), { ...l, streaming: false }]
+        }
+        return prev
+      })
+      setLoading(false)
+    } else if (type === 'error') {
+      setMsgs(prev => [...prev, { id: uid(), role: 'system', content: '⚠️ ' + val, ts: Date.now() }])
+      setLoading(false)
+    }
+  }, [])
+
+  const send = useCallback(async (text?: string) => {
+    const msg = (text ?? input).trim()
+    if (!msg && !imgBase64) return
+
+    setMsgs(prev => [...prev, { id: uid(), role: 'user', content: msg,
+                                image: imgPreview ?? undefined, ts: Date.now() }])
+    setInput('')
+    setLoading(true)
+    // Save user message to persistent memory
+    saveToMemory('user', msg).catch(() => {})
+    // ── Persist to Supabase ───────────────────────────────────────────────
+    const sid = sessionId || getLocalSessionId()
+    const isFirstMsg = msgsRef.current.filter(m => m.role === 'user').length === 0
+    ensureSession(sid, mode, provider).then(() => {
+      if (isFirstMsg) setSessionTitle(sid, msg)
+      saveMessage(sid, 'user', msg)
+    })
+
+    const history = msgsRef.current
+      .filter(m => m.role !== 'system')
+      .map(m => ({
+        role: m.role === 'ai' ? 'assistant' : 'user',
+        content: m.content,
+      }))
+    // Prepend persistent memory context as system message if available
+    const historyWithMemory = memoryContext
+      ? [{ role: 'system', content: memoryContext }, ...history]
+      : history
+
+    if (abortRef.current) abortRef.current.abort()
+    const ac = new AbortController()
+    abortRef.current = ac
+
+    try {
+      if (aiMode === 'local') {
+        // ── Local inference via WebLLM ──────────────────────────────────────
+        const loaded = await localLLM.load()
+        if (!loaded) {
+          setMsgs(prev => [...prev, { id: uid(), role: 'system',
+            content: '⚠️ Local AI not available. Switching to Cloud.', ts: Date.now() }])
+          setAiMode('cloud')
+          setLoading(false)
+          return
+        }
+
+        // Build messages for local model (no image support in local mode)
+        const memoryPrefix = memoryContext ? '\n\nContext from previous sessions:\n' + memoryContext : ''
+        const systemPrompt = `You are CodeThinker — a chain-of-thought AI for developers.
+Think step by step before answering. Use 【step】 markers for reasoning.
+Wrap code in \`\`\`lang blocks. Be concise and practical.`
+
+        const localMessages = [
+          { role: 'system', content: systemPrompt },
+          ...history.slice(-10),
+          { role: 'user', content: msg },
+        ]
+
+        const aiMsgId = uid()
+        setMsgs(prev => [...prev, { id: aiMsgId, role: 'ai', content: '', streaming: true, ts: Date.now(), thinkingSteps: [], thinkingOpen: false }])
+
+        await localLLM.chat(
+          localMessages,
+          (token) => {
+            handleEvent('token', token)
+          },
+          () => {
+            handleEvent('done', '')
+          },
+          (err) => {
+            setMsgs(prev => [...prev, { id: uid(), role: 'system', content: '⚠️ Local error: ' + err, ts: Date.now() }])
+            setLoading(false)
+          }
+        )
+      } else {
+        // ── Cloud inference via Groq ─────────────────────────────────────────
+        const res = await fetch('/api/codethinker/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: msg, history: historyWithMemory, session_id: typeof window !== 'undefined' ? localStorage.getItem('codethinker_session_id') || '' : '', image: imgBase64 || undefined, imageMime: imgBase64 ? imgMime : undefined, mode, provider, openaiKey }),
+          signal: ac.signal,
+        })
+
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data: ')) continue
+            try {
+              const d = JSON.parse(trimmed.slice(6))
+              handleEvent(d.t || d.type || '', d.v ?? d.content ?? '')
+              // Save completed AI message to Supabase
+              if ((d.t || d.type) === 'done') {
+                const aiMsg = msgsRef.current.filter(m => m.role === 'ai').at(-1)
+                if (aiMsg?.content) {
+                  const thinking = aiMsg.thinkingSteps?.join('\n---\n') || undefined
+                  saveMessage(sessionId || getLocalSessionId(), 'assistant', aiMsg.content, thinking)
+                }
+              }
+            } catch { /* skip */ }
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        setMsgs(prev => [...prev, { id: uid(), role: 'system', content: '⚠️ Connection error', ts: Date.now() }])
+      }
+      setLoading(false)
+    }
+
+    setImgPreview(null); setImgBase64(null); setImgMime('image/jpeg')
+    // Mobile: dismiss keyboard, Desktop: keep focus
+    const isMobile = 'ontouchstart' in globalThis
+    if (isMobile) { inputRef.current?.blur() }
+    else { setTimeout(() => inputRef.current?.focus(), 50) }
+  }, [input, imgBase64, imgPreview, handleEvent])
+
+  const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+  }
+
+  const startNewChat = useCallback(() => {
+    clearLocalSessionId()
+    const newSid = getLocalSessionId()
+    setSessionId(newSid)
+    setMsgs([])
+    setHistoryOpen(false)
+  }, [])
+
+  const openHistory = useCallback(async () => {
+    setHistoryLoading(true)
+    setHistoryOpen(true)
+    const s = await loadSessions()
+    setSessions(s)
+    setHistoryLoading(false)
+  }, [])
+
+  const loadSession = useCallback(async (sid: string) => {
+    const dbMsgs = await loadMessages(sid)
+    const restored: Msg[] = dbMsgs
+      .filter(m => m.role !== 'system')
+      .map(m => ({
+        id: m.id,
+        role: m.role === 'assistant' ? 'ai' : 'user',
+        content: m.content,
+        ts: new Date(m.created_at).getTime(),
+        thinkingSteps: m.thinking ? m.thinking.split('\n---\n') : undefined,
+        thinkingOpen: false,
+        thinkingDone: true,
+      }))
+    localStorage.setItem('codethinker_session_id', sid)
+    setSessionId(sid)
+    setMsgs(restored)
+    setHistoryOpen(false)
+  }, [])
+  const onFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]; if (!file) return
+    const mime = file.type || 'image/jpeg'
+    const reader = new FileReader()
+    reader.onload = () => {
+      const r = reader.result as string
+      setImgPreview(r); setImgBase64(r.split(',')[1]); setImgMime(mime)
+    }
+    reader.readAsDataURL(file)
+    // Reset input so same file can be selected again
+    e.target.value = ''
+  }
+
+  const toggleThinking = (id: string) =>
+    setMsgs(prev => prev.map(m => m.id === id ? { ...m, thinkingOpen: !m.thinkingOpen } : m))
+
+  return (
+    <div
+      className="flex flex-col text-[#E0E0E0] font-sans relative overflow-hidden"
+      style={{ height: "100dvh", backgroundImage: 'url(/codethinker-bg.jpg)', backgroundSize: 'cover', backgroundPosition: 'center' }}
+    >
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-[2px] z-0" />
+      
+
+      <header className="relative z-10 shrink-0 flex items-center justify-between py-3 md:py-4 border-b border-white/10 bg-black/30 backdrop-blur" style={{ paddingLeft: 'max(16px, env(safe-area-inset-left))', paddingRight: 'max(16px, env(safe-area-inset-right))', paddingTop: 'max(12px, env(safe-area-inset-top))' }}>
+        <div className="flex items-center gap-3">
+          <span className="text-lg md:text-xl">{"⚡"}</span>
+          <span className="font-bold text-white tracking-tight text-sm md:text-base">GodLocal</span>
+          <span className="text-[10px] md:text-xs font-mono text-[#A78BFA]/70 border border-[#A78BFA]/25 px-2 py-0.5 rounded-full">CodeThinker</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="w-1.5 h-1.5 md:w-2 md:h-2 rounded-full bg-[#A78BFA] animate-pulse" />
+          <span className="text-[10px] md:text-xs text-white/35 font-mono hidden sm:block">online</span>
+          {/* Local AI toggle */}
+          <button
+            onClick={() => {
+              if (aiMode === 'local') {
+                localLLM.unload()
+                setAiMode('cloud')
+              } else {
+                if (!localLLM.isSupported()) {
+                  setMsgs(prev => [...prev, { id: uid(), role: 'system', content: '⚠️ Local AI requires WebGPU. Supported in Chrome 124+ or Safari iOS 17+.', ts: Date.now() }])
+                  return
+                }
+                setAiMode('local')
+              }
+            }}
+            title={aiMode === 'local' ? 'LOCAL AI (click to switch to Cloud)' : 'CLOUD AI (click to switch to Local)'}
+            className={`flex items-center gap-1 px-2 py-0.5 rounded-lg text-[9px] md:text-[10px] font-mono border transition-all ${
+              aiMode === 'local'
+                ? 'bg-[#00FF9D]/15 border-[#00FF9D]/40 text-[#00FF9D]'
+                : 'bg-white/5 border-white/10 text-white/35 hover:text-white/60'
+            }`}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${aiMode === 'local' ? 'bg-[#00FF9D] animate-pulse' : 'bg-white/20'}`} />
+            {aiMode === 'local'
+              ? (localLLM.status.phase === 'loading' ? `${(localLLM.status as {phase:string;progress:number}).progress}%` : 'LOCAL')
+              : 'CLOUD'}
+          </button>
+          {/* Model loading progress (full-width bar below header) */}
+          {localLLM.status.phase === 'loading' && (
+            <div className="absolute top-full left-0 right-0 z-20 bg-[#0d1017]/95 border-b border-white/10 px-4 py-2">
+              <div className="flex items-center gap-2">
+                <div className="flex-1 h-0.5 bg-white/10 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-[#00FF9D] rounded-full transition-all duration-500"
+                    style={{ width: `${(localLLM.status as {phase:string;progress:number}).progress}%` }}
+                  />
+                </div>
+                <span className="text-[9px] text-white/40 font-mono">
+                  {(localLLM.status as {phase:string;progress:number}).progress}%
+                </span>
+              </div>
+              <p className="text-[9px] text-white/25 mt-0.5 truncate">
+                Qwen2.5-1.5B · {(localLLM.status as {phase:string;text:string}).text}
+              </p>
+            </div>
+          )}
+          {/* Provider toggle: Groq → DeepSeek V3.2 → GPT-4o → Groq */}
+          {aiMode === 'cloud' && (
+            <button
+              onClick={() => {
+                if (provider === 'groq') {
+                  setProvider('deepseek')
+                  localStorage.setItem('ct_provider', 'deepseek')
+                } else if (provider === 'deepseek') {
+                  // Switch to GPT-4o — check if key exists
+                  const key = localStorage.getItem('ct_openai_key') || ''
+                  if (!key) {
+                    setKeyInput('')
+                    setShowSettings(true)
+                  } else {
+                    setProvider('openai')
+                    localStorage.setItem('ct_provider', 'openai')
+                  }
+                } else {
+                  setProvider('groq')
+                  localStorage.setItem('ct_provider', 'groq')
+                }
+              }}
+              title={
+                provider === 'groq' ? 'Groq (Fast) — click to switch to DeepSeek V3.2'
+                : provider === 'deepseek' ? 'DeepSeek V3.2 (Smart) — click to switch to GPT-4o'
+                : 'GPT-4o — click to switch to Groq'
+              }
+              className={`flex items-center gap-1 px-2 py-0.5 rounded-lg text-[9px] md:text-[10px] font-mono border transition-all ${
+                provider === 'openai'
+                  ? 'bg-[#10a37f]/15 border-[#10a37f]/40 text-[#10a37f]'
+                  : provider === 'deepseek'
+                  ? 'bg-[#4D9FFF]/15 border-[#4D9FFF]/40 text-[#4D9FFF]'
+                  : 'bg-white/5 border-white/10 text-white/35 hover:text-white/60'
+              }`}
+            >
+              {provider === 'openai' ? '✦ GPT-4o' : provider === 'deepseek' ? '🐋 DeepSeek' : '⚡ Groq'}
+            </button>
+          )}
+
+          {/* Settings gear — for OpenAI key */}
+          <button
+            onClick={() => { setKeyInput(openaiKey); setShowSettings(true) }}
+            title="Settings"
+            className="w-7 h-7 flex items-center justify-center rounded-xl border border-white/10 bg-black/20 text-white/30 hover:text-white/70 hover:bg-white/10 hover:border-white/20 transition-all"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+            </svg>
+          </button>
+
+          {/* Settings modal — OpenAI key input */}
+          {showSettings && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+              onClick={e => { if (e.target === e.currentTarget) setShowSettings(false) }}>
+              <div className="bg-[#0d1017] border border-white/15 rounded-2xl p-6 w-full max-w-sm shadow-2xl">
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-white font-semibold text-sm">Settings</h2>
+                  <button onClick={() => setShowSettings(false)} className="text-white/40 hover:text-white text-lg leading-none">×</button>
+                </div>
+
+                <div className="mb-4">
+                  <label className="block text-[11px] text-white/50 font-mono mb-2">OpenAI API Key</label>
+                  <input
+                    type="password"
+                    value={keyInput}
+                    onChange={e => setKeyInput(e.target.value)}
+                    placeholder="sk-..."
+                    className="w-full bg-white/5 border border-white/15 rounded-lg px-3 py-2 text-sm text-white font-mono placeholder-white/20 focus:outline-none focus:border-[#10a37f]/50 transition-colors"
+                  />
+                  <p className="mt-1.5 text-[10px] text-white/30">
+                    Stored locally in your browser. Never sent to our servers.
+                    <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer"
+                      className="ml-1 text-[#10a37f]/70 hover:text-[#10a37f] underline">
+                      Get key →
+                    </a>
+                  </p>
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => {
+                      const k = keyInput.trim()
+                      localStorage.setItem('ct_openai_key', k)
+                      setOpenaiKey(k)
+                      if (k) {
+                        setProvider('openai')
+                        localStorage.setItem('ct_provider', 'openai')
+                      } else {
+                        setProvider('groq')
+                        localStorage.setItem('ct_provider', 'groq')
+                      }
+                      setShowSettings(false)
+                    }}
+                    className="flex-1 bg-[#10a37f]/20 hover:bg-[#10a37f]/30 border border-[#10a37f]/40 text-[#10a37f] rounded-lg py-2 text-sm font-medium transition-all"
+                  >
+                    Save & use GPT-4o
+                  </button>
+                  {openaiKey && (
+                    <button
+                      onClick={() => {
+                        localStorage.removeItem('ct_openai_key')
+                        localStorage.setItem('ct_provider', 'groq')
+                        setOpenaiKey('')
+                        setProvider('groq')
+                        setKeyInput('')
+                        setShowSettings(false)
+                      }}
+                      className="px-3 border border-red-500/30 text-red-400/70 hover:text-red-400 rounded-lg text-sm transition-all"
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+
+                <div className="mt-4 pt-4 border-t border-white/10">
+                  <p className="text-[10px] text-white/30 font-mono mb-1">Active model</p>
+                  <div className="flex items-center gap-2">
+                    <span className={`w-1.5 h-1.5 rounded-full ${provider === 'openai' ? 'bg-[#10a37f] animate-pulse' : 'bg-[#A78BFA] animate-pulse'}`} />
+                    <span className="text-xs text-white/60 font-mono">
+                      {provider === 'openai' ? 'gpt-4o (OpenAI)' : 'llama-3.3-70b (Groq)'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <button onClick={() => setRadioOpen(r => !r)} title="Radio"
+             className={`w-7 h-7 flex items-center justify-center rounded-xl border transition-all ${radioPlaying ? 'border-[#A78BFA]/40 bg-[#A78BFA]/10 text-[#A78BFA] animate-pulse' : 'border-white/10 bg-black/20 text-white/30 hover:text-white/70 hover:bg-white/10 hover:border-white/20'}`}>
+            <span className="text-xs">📻</span>
+          </button>
+          {/* New Chat button */}
+          <button
+            onClick={startNewChat}
+            title="New Chat"
+            className="ml-1 w-7 h-7 flex items-center justify-center rounded-xl border border-white/10 bg-black/20 text-white/30 hover:text-white/70 hover:bg-white/10 hover:border-white/20 transition-all"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </button>
+
+          {/* History button */}
+          <button
+            onClick={openHistory}
+            title="Chat History"
+            className="ml-1 w-7 h-7 flex items-center justify-center rounded-xl border border-white/10 bg-black/20 text-white/30 hover:text-white/70 hover:bg-white/10 hover:border-white/20 transition-all"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.95"/>
+            </svg>
+          </button>
+
+          <a href="/codethinker" title="Settings"
+             className="ml-1 w-7 h-7 flex items-center justify-center rounded-xl border border-white/10 bg-black/20 text-white/30 hover:text-white/70 hover:bg-white/10 hover:border-white/20 transition-all">
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3"/><path d="M19.07 4.93A10 10 0 0 1 21 12a10 10 0 0 1-1.93 7.07M4.93 4.93A10 10 0 0 0 3 12a10 10 0 0 0 1.93 7.07"/>
+              <path d="m16.24 7.76-1.22 1.22M7.76 16.24l-1.22 1.22M16.24 16.24l-1.22-1.22M7.76 7.76 6.54 6.54"/>
+            </svg>
+          </a>
+        </div>
+      {/* ── Chat History Modal ──────────────────────────────────────── */}
+      {historyOpen && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-16 px-4"
+          onClick={e => { if (e.target === e.currentTarget) setHistoryOpen(false) }}>
+          <div className="w-full max-w-md bg-[#0d0d0f] border border-white/10 rounded-2xl shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+              <h2 className="text-white font-semibold text-sm">Chat History</h2>
+              <button onClick={() => setHistoryOpen(false)} className="text-white/40 hover:text-white text-lg leading-none">×</button>
+            </div>
+            <div className="max-h-80 overflow-y-auto divide-y divide-white/5">
+              {historyLoading && (
+                <div className="px-4 py-6 text-center text-white/40 text-sm">Loading…</div>
+              )}
+              {!historyLoading && sessions.length === 0 && (
+                <div className="px-4 py-6 text-center text-white/40 text-sm">No saved chats yet</div>
+              )}
+              {!historyLoading && sessions.map(s => (
+                <button key={s.id} onClick={() => loadSession(s.id)}
+                  className="w-full text-left px-4 py-3 hover:bg-white/5 transition-colors">
+                  <div className="text-white/80 text-sm truncate">{s.title || 'Untitled chat'}</div>
+                  <div className="text-white/30 text-xs mt-0.5">
+                    {s.mode} · {new Date(s.updated_at).toLocaleDateString()}
+                  </div>
+                </button>
+              ))}
+            </div>
+            <div className="px-4 py-3 border-t border-white/10">
+              <button onClick={startNewChat}
+                className="w-full py-2 rounded-xl bg-[#A78BFA]/20 hover:bg-[#A78BFA]/30 text-[#A78BFA] text-sm font-medium transition-colors">
+                + New Chat
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      </header>
+
+      <div className="relative z-10 flex flex-1 overflow-hidden justify-center">
+        <div className="flex flex-col w-full md:max-w-2xl lg:max-w-3xl xl:max-w-4xl overflow-hidden">
+
+          <div className="flex-1 overflow-y-auto py-4 md:py-6 space-y-3 md:space-y-4"
+            style={{ paddingLeft: 'max(12px, env(safe-area-inset-left))', paddingRight: 'max(12px, env(safe-area-inset-right))', scrollbarWidth: 'thin', scrollbarColor: 'rgba(0,255,157,0.15) transparent' }}>
+
+            {msgs.length === 0 && (
+              <motion.div
+                initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5 }}
+                className="flex flex-col items-center justify-center h-full gap-6 md:gap-10 pb-12"
+              >
+                <div className="text-center px-4">
+                  <motion.div className="text-4xl md:text-6xl mb-3 md:mb-5"
+                    animate={{ scale: [1, 1.08, 1] }} transition={{ repeat: Infinity, duration: 3, ease: 'easeInOut' }}>
+                    {"⚡"}
+                  </motion.div>
+                  <h1 className="text-xl md:text-3xl font-bold text-white mb-2 tracking-tight">CodeThinker</h1>
+                  <p className="text-white/45 text-xs md:text-sm">Your AI with memory, search, and tools</p>
+                </div>
+                <div className="grid grid-cols-2 gap-2 w-full max-w-xs md:max-w-md px-2">
+                  {QUICK[mode].map(q => (
+                    <button key={q} onClick={() => send(q)}
+                      className="text-left text-[11px] md:text-xs px-3 py-2.5 md:py-3 rounded-xl border border-white/10 bg-black/30 hover:bg-[#A78BFA]/10 hover:border-[#A78BFA]/35 transition-all text-white/50 hover:text-white/85 leading-snug backdrop-blur-sm">
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              </motion.div>
+            )}
+
+            <AnimatePresence initial={false}>
+              {msgs.map(m => (
+                <motion.div key={m.id}
+                  initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.18 }}
+                  className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  {m.role === 'system' ? (
+                    <span className="text-[10px] md:text-xs text-white/25 font-mono px-3 py-1 rounded-full bg-black/30 border border-white/8 backdrop-blur-sm">
+                      {m.content}
+                    </span>
+                  ) : (
+                    <div className={`max-w-[88%] md:max-w-[78%] ${m.role === 'user' ? 'order-2' : ''}`}>
+                      {m.image && <img src={m.image} alt="" className="rounded-xl mb-2 max-h-44 md:max-h-56 object-cover" />}
+                      {m.role === 'ai' && (
+                        <ThinkingBlock
+                          steps={m.thinkingSteps || []}
+                          streaming={!m.thinkingDone}
+                          open={m.thinkingOpen || false}
+                          onToggle={() => toggleThinking(m.id)}
+                        />
+                      )}
+                      <div className={`rounded-2xl px-3.5 md:px-4 py-2.5 md:py-3 ${
+                        m.role === 'user'
+                          ? 'bg-[#A78BFA]/15 border border-[#A78BFA]/25 text-white ml-auto backdrop-blur-sm'
+                          : 'bg-black/45 border border-white/12 text-[#E8E8E8] backdrop-blur-sm'
+                      }`}>
+                        {m.role === 'user'
+                          ? <span className="text-sm leading-relaxed">{m.content}</span>
+                          : <MsgContent content={m.content} streaming={m.streaming} />}
+                      </div>
+                    </div>
+                  )}
+                </motion.div>
+              ))}
+            </AnimatePresence>
+
+            {loading && msgs[msgs.length - 1]?.role !== 'ai' && (
+              <div className="flex justify-start">
+                <div className="bg-black/45 border border-white/12 backdrop-blur-sm rounded-2xl px-4 py-3">
+                  <div className="flex gap-1">
+                    {[0, 0.15, 0.3].map((d, i) => (
+                      <span key={i} className="w-1.5 h-1.5 rounded-full bg-[#A78BFA]/60 animate-bounce"
+                        style={{ animationDelay: `${d}s` }} />
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+            <div ref={bottomRef} />
+          </div>
+
+          <AnimatePresence>
+            {imgPreview && (
+              <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }} className="shrink-0 px-3 md:px-4 pb-2">
+                <div className="relative inline-block">
+                  <img src={imgPreview} alt="" className="h-16 md:h-20 rounded-xl object-cover border border-white/15" />
+                  <button onClick={() => { setImgPreview(null); setImgBase64(null); setImgMime('image/jpeg') }}
+                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-white/25 hover:bg-white/45 text-xs flex items-center justify-center transition-all">{'\u2715'}</button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+
+          {/* Radio Panel */}
+          <AnimatePresence>
+            {radioOpen && (
+              <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }} className="shrink-0 px-3 md:px-4 pb-2">
+                <div className="bg-black/60 border border-white/15 backdrop-blur-md rounded-2xl p-3 space-y-1.5">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[11px] font-bold text-white/60 uppercase tracking-wider">📻 Radio</span>
+                    <button onClick={() => { setRadioOpen(false); audioRef.current?.pause(); setRadioPlaying(null) }}
+                      className="text-white/30 hover:text-white/60 text-xs">✕</button>
+                  </div>
+                  {RADIO_STATIONS.map(s => (
+                    <button key={s.url} onClick={() => toggleRadio(s.url)}
+                      className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl text-left text-xs transition-all ${radioPlaying === s.url ? 'bg-[#A78BFA]/15 border border-[#A78BFA]/30 text-white' : 'bg-white/5 border border-white/8 text-white/50 hover:text-white/80 hover:bg-white/10'}`}>
+                      <span>{s.emoji}</span>
+                      <span className="flex-1">{s.name}</span>
+                      {radioPlaying === s.url && <span className="text-[#A78BFA] text-[10px] animate-pulse">▶ LIVE</span>}
+                    </button>
+                  ))}
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* ── Mode selector ── */}
+          <div className="shrink-0 pb-2" style={{ paddingLeft: 'max(12px, env(safe-area-inset-left))', paddingRight: 'max(12px, env(safe-area-inset-right))' }}>
+            <div className="flex gap-1.5 overflow-x-auto" style={{ scrollbarWidth: 'none', WebkitOverflowScrolling: 'touch' }}>
+              {MODES.map(m => (
+                <button
+                  key={m.key}
+                  onClick={() => setMode(m.key)}
+                  className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-medium transition-all border ${
+                    mode === m.key && m.key === 'search'
+                      ? 'bg-[#00FF9D]/10 border-[#00FF9D]/40 text-[#00FF9D] shadow-[0_0_12px_rgba(0,255,157,0.2)]'
+                      : mode === m.key
+                      ? 'bg-[#A78BFA]/15 border-[#A78BFA]/50 text-[#A78BFA] shadow-[0_0_12px_rgba(167,139,250,0.25)]'
+                      : 'bg-black/25 border-white/10 text-white/40 hover:text-white/70 hover:border-white/20 hover:bg-white/5'
+                  }`}
+                >
+                  <span>{m.icon}</span>
+                  <span>{m.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="shrink-0 pt-2" style={{ paddingLeft: 'max(12px, env(safe-area-inset-left))', paddingRight: 'max(12px, env(safe-area-inset-right))', paddingBottom: 'max(16px, env(safe-area-inset-bottom))' }}>
+            <div className="flex items-end gap-2 bg-black/50 border border-white/15 rounded-2xl px-3 md:px-4 py-2.5 md:py-3 focus-within:border-[#A78BFA]/40 transition-all backdrop-blur-md shadow-lg shadow-black/30">
+              <button onClick={() => fileRef.current?.click()}
+                className="shrink-0 w-8 h-8 flex items-center justify-center rounded-xl text-white/35 hover:text-white/65 hover:bg-white/10 transition-all"
+                title="Attach image">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/>
+                  <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>
+                </svg>
+              </button>
+              <button onClick={toggleVoice}
+                className={`shrink-0 w-8 h-8 flex items-center justify-center rounded-xl transition-all ${isListening ? 'text-red-400 bg-red-500/20 animate-pulse border border-red-500/40' : 'text-white/35 hover:text-white/65 hover:bg-white/10'}`}
+                title={isListening ? 'Stop recording' : 'Voice input'}>
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/>
+                </svg>
+              </button>
+              <input ref={fileRef} type="file" accept="image/*,.pdf,.txt,.csv,.json,.doc,.docx" className="hidden" onChange={onFile} />
+              <textarea ref={inputRef} value={input} onChange={e => setInput(e.target.value)} onKeyDown={onKey}
+                placeholder={mode === 'search' ? '🌐 Спроси что угодно — отвечу с реальными данными из интернета...' : MODES.find(m => m.key === mode)?.desc ?? "Опиши идею — получи проект..."}  rows={3}
+                className="flex-1 bg-transparent resize-none outline-none text-white placeholder-white/30 leading-relaxed min-h-[60px] max-h-40 overflow-y-auto py-1"
+                style={{ fontSize: '16px', scrollbarWidth: 'none' }} />
+              <button onClick={() => send()}
+                disabled={(!input.trim() && !imgBase64) || loading}
+                className="shrink-0 w-8 h-8 flex items-center justify-center rounded-xl bg-[#A78BFA]/20 border border-[#A78BFA]/40 text-[#A78BFA] disabled:opacity-20 disabled:cursor-not-allowed hover:bg-[#A78BFA]/35 hover:border-[#A78BFA]/60 transition-all active:scale-95">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>
+                </svg>
+              </button>
+            </div>
+            <p className="text-center text-[9px] md:text-[10px] text-white/18 mt-1.5 font-mono">
+              CodeThinker · Chain-of-Thought AI · GodLocal
+            </p>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  )
+}
