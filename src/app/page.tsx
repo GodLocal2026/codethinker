@@ -29,7 +29,7 @@ interface Msg {
   thinkingDone?: boolean
 }
 
-type Mode = 'vibe' | 'debug' | 'refactor' | 'architect' | 'explain' | 'search'
+type Mode = 'vibe' | 'debug' | 'refactor' | 'architect' | 'explain' | 'search' | 'team'
 
 const MODES: { key: Mode; icon: string; label: string; desc: string }[] = [
   { key: 'vibe',      icon: '🔨', label: 'Vibe Code', desc: 'Опиши идею — получи проект' },
@@ -38,6 +38,7 @@ const MODES: { key: Mode; icon: string; label: string; desc: string }[] = [
   { key: 'architect', icon: '📐', label: 'Architect',  desc: 'Спроектирую архитектуру' },
   { key: 'explain',   icon: '📝', label: 'Explain',   desc: 'Объясню чужой код' },
   { key: 'search',    icon: '🌐', label: 'Search',    desc: 'Ищу в интернете — live данные' },
+  { key: 'team', icon: '👥', label: 'Team', desc: 'Parallel module architecture' }
 ]
 
 const QUICK: Record<Mode, string[]> = {
