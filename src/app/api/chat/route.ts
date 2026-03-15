@@ -117,7 +117,18 @@ const TOOLS = [
 
 async function executeTool(name: string, args: Record<string, string>): Promise<string> {
   switch (name) {
-    case 'web_search':   return toolWebSearch(args.query || '');
+    case 'web_search': {
+      // CCG-inspired parallel search: general + docs
+      const [main, docs] = await Promise.all([
+        toolWebSearch(args.query || ''),
+        toolWebSearch((args.query || '') + ' site:github.com OR documentation'),
+      ]);
+      try {
+        const mR = JSON.parse(main); const dR = JSON.parse(docs);
+        const merged = [...(mR.results||[]), ...(dR.results||[])].slice(0,8);
+        return JSON.stringify({ results: merged });
+      } catch { return main; }
+    }
     case 'crypto_price': return toolCryptoPrice(args.coins || '');
     case 'get_datetime': return toolGetDateTime();
     default:             return JSON.stringify({ error: `Unknown tool: ${name}` });
@@ -161,9 +172,29 @@ Always include relevant thinking steps. Users see them as a collapsible chain.`;
     vibe: `\n\n## Mode: Vibe Coding \ud83d\udd28\nYou are in creative, opinionated code generation mode. The user describes an idea \u2014 you build it immediately.\n\n### Output format:\n1. Generate complete, working code \u2014 no pseudo-code, no skipping files\n2. After the code: a 2-4 sentence description of what was built and WHY\n3. Add 1-3 real, verified links if relevant (MDN, official docs, etc.)\n4. One concrete next step: \ud83d\udca1 **Next step**: ...\n\n### Code quality:\n- Meaningful, self-documenting names\n- Single responsibility per function\n- File structure: imports \u2192 types \u2192 constants \u2192 functions \u2192 exports\n- Modern stack: TypeScript, React/Next.js, Tailwind\n- Start with code immediately \u2014 no long introductions`,
     debug: `\n\n## Mode: Debug \ud83d\udc1b\nDebugging expert. Show EXACT fix with before/after. Explain WHY the bug happened. Parse error messages line by line. Suggest prevention.`,
     refactor: `\n\n## Mode: Refactor \ud83d\udd27\nCode optimization expert. Show before \u2192 after diffs. Calculate complexity improvements. Apply SOLID, DRY, KISS. Add TypeScript types.`,
-    architect: `\n\n## Mode: Architecture \ud83d\udcd0\nSystem design expert. ASCII diagrams. Describe components, data flow, APIs, DB schema. Tech stack recommendations with reasoning.`,
+    architect: `\n\n## Mode: Architecture \ud83d\uddfa\ufe0f \u2014 Spec-Driven Development\nNo improvisation. Work in 3 phases.\n\n**PHASE 1 \u2014 CONSTRAINTS**\nVerifiable constraints only (not \"fast\" but \"p99 < 200ms\"). List what MUST be true: performance, scalability, security, compatibility.\n\n**PHASE 2 \u2014 ZERO-DECISION PLAN**\nEach step has one obvious implementation. Explicit choices with one-line rationale. No \"it depends\".\n\n**PHASE 3 \u2014 CROSS-REVIEW**\n3 risks \u00b7 2 alternatives considered \u00b7 1 open question for the user.\n\nOutput format:\n### Constraints (verifiable)\n### Tech Stack (with rationale)\n### Implementation Plan (step-by-step, zero ambiguity)\n### ASCII Architecture Diagram\n### Risks & Open Questions`,
     explain: `\n\n## Mode: Explain \ud83d\udcdd\nPatient code teacher. Break down section by section. Explain WHAT and WHY. Add inline comments. Simple language.`,
     search: `\n\n## Mode: Open Search \ud83c\udf10\nYou are an AI-powered search assistant. Your PRIMARY job is to search the web and provide accurate, up-to-date answers.\n\n### Rules:\n1. **ALWAYS call web_search first** \u2014 even if you think you know the answer. The user is in Search mode because they want real-time data.\n2. **Multiple searches allowed** \u2014 search 2-3 times if needed to get comprehensive info.\n3. **Cite your sources** \u2014 after every factual claim, include the source URL in markdown: [Source](url)\n4. **Structure your answer**:\n   - \ud83d\udccc **Direct answer** \u2014 one clear sentence at the top\n   - \ud83d\udcca **Details** \u2014 expand with data, numbers, context\n   - \ud83d\udd17 **Sources** \u2014 list all sources at the bottom\n5. **For crypto/prices** \u2014 use crypto_price tool first, then add context from web_search\n6. **Be factual** \u2014 no hallucinations. If search fails, say so clearly.\n7. **Language** \u2014 respond in the same language the user writes in.`,
+  team: `
+
+## Mode: Team 👥 — Parallel Module Architecture
+Break complex tasks into independent modules (like a dev team).
+
+For each request, output 3 parallel workstreams:
+
+**Module 1 — Frontend/UI**
+Component tree, props interface, state shape, key interactions.
+
+**Module 2 — Backend/API**
+Endpoints, data models, business logic, error handling.
+
+**Module 3 — Infrastructure/Tests**
+Config, env vars, test cases, deployment notes.
+
+**Integration Plan**
+How modules connect: contracts, shared types, sequencing.
+
+Each module is self-contained — a dev can implement it independently.`,
   };
 
   return base + (modePrompts[mode] || modePrompts.vibe);
